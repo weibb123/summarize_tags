@@ -1,104 +1,256 @@
 import streamlit as st
 import pandas as pd
+import os
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain, create_tagging_chain, create_tagging_chain_pydantic
-from langchain.llms import OpenAI
+from langchain.vectorstores import Chroma
 from langchain.chat_models import ChatOpenAI
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
 from langchain.callbacks import get_openai_callback
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from rouge_score import rouge_scorer
+from sentence_transformers import CrossEncoder
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.document_loaders import TextLoader
 from sidebar import *
+from tagging import *
 
 
-st.set_page_config(page_title="Summarize and Tagging MA Bills")
+st.set_page_config(page_title="Summarize and Tagging MA Bills", layout='wide')
 st.title('Summarize Bills')
 
 sbar()
 
-template = """"You are a summarizer model that summarizes legal bills and legislation and talks about the bills purpose and any amendments. 
+
+template = """"You are a summarizer model that summarizes legal bills and legislation. Please include the bill's main purpose, relevant key points and any amendements. 
 The summaries must be easy to understand and accurate based on the provided bill. I want you to summarize the legal bill and legislation. 
 Use the title {title} to guide your summary. Summarize the bill that reads as follows:\n{context}\n\nSummary: An Act [bill title]. This bill [key information].
 """
 
-prompt = PromptTemplate(
-    input_variables=["context", "title"],
-    template=template
-)
+# model to test hallucination
+model = CrossEncoder('vectara/hallucination_evaluation_model')
 
 # load the dataset
-df = pd.read_csv("all_bills.csv")
+df = pd.read_csv("demoapp/all_bills.csv")
 
-def find_bills(bill_title):
+def find_bills(bill_number, bill_title):
     """input:
-    args: bill_title: (str), Use the title of the bill to find titles and content
+    args: bill_number: (str), Use the number of the bill to find its title and content
     """
-    bill = df[df['Title'] == bill_title]['DocumentText']
+    bill = df[df['BillNumber'] == bill_number]['DocumentText']
 
     try:
          # Locate the index of the bill
         idx = bill.index.tolist()[0]
-        # Locate the content of bill based on idx
+        # Locate the content and bill title of bill based on idx
         content = df['DocumentText'].iloc[idx]
-        bill_title = df['Title'].iloc[idx]
+        #bill_title = df['Title'].iloc[idx]
+        bill_number = df['BillNumber'].iloc[idx]
 
     except Exception as e:
         content = "blank"
-        st.error("cannot find such bill from the source")
+        st.error("Cannot find such bill from the source")
     
-    return content, bill_title
+    return content, bill_title, bill_number
 
+bills_to_select = {
+    '#H3121': 'An Act relative to the open meeting law',
+    '#S2064': 'An Act extending the public records law to the Governor and the Legislature',
+    '#H711': 'An Act providing a local option for ranked choice voting in municipal elections',
+    '#S1979': 'An Act establishing a jail and prison construction moratorium',
+    '#H489': 'An Act providing affordable and accessible high-quality early education and care to promote child development and well-being and support the economy in the Commonwealth',
+    '#S2014': 'An Act relative to collective bargaining rights for legislative employees',
+    '#S301': 'An Act providing affordable and accessible high quality early education and care to promote child development and well-being and support the economy in the Commonwealth',
+    '#H3069': 'An Act relative to collective bargaining rights for legislative employees',
+    '#S433': 'An Act providing a local option for ranked choice voting in municipal elections',
+    '#H400': 'An Act relative to vehicle recalls',
+    '#H538': 'An Act to Improve access, opportunity, and capacity in Massachusetts vocational-technical education',
+    '#S257': 'An Act to end discriminatory outcomes in vocational school admissions'
+}
+
+# Displaying the selectbox
+selectbox_options = [f"{number}: {title}" for number, title in bills_to_select.items()]
 option = st.selectbox(
     'Select a Bill',
-    ('An Act establishing a sick leave bank for Christopher Trigilio, an employee of the trial court',
-     'An Act authorizing the State Board of Retirement to grant creditable service to Paul Lemelin',
-     'An Act providing living organ donor protections',
-     )
+    selectbox_options
 )
 
-bill_content, bill_title = find_bills(option)
+# Extracting the bill number from the selected option
+selected_num = option.split(":")[0][1:]
+selected_title = option.split(":")[1]
+
+bill_content, bill_title, bill_number = find_bills(selected_num, selected_title)
+
+
+def generate_categories(text):
+    """
+    generate tags and categories
+    parameters:
+        text: (string)
+    """
+    try:
+        API_KEY = st.session_state["OPENAI_API_KEY"]
+    except Exception as e:
+         return st.error("Invalid [OpenAI API key](https://beta.openai.com/account/api-keys) or not found")
+    
+    # LLM
+    category_prompt = """According to this list of category {category}.
+
+        classify this bill {context} into a closest relevant category.
+
+        Do not output a category outside from the list
+    """
+
+    prompt = PromptTemplate(template=category_prompt, input_variables=["context", "category"])
+
+    
+    llm = LLMChain(
+            llm = ChatOpenAI(openai_api_key=API_KEY, temperature=0, model='gpt-4'), prompt=prompt)
+        
+    response = llm.predict(context = text, category = category_for_bill) # grab from tagging.py
+    return response
+
+def generate_tags(category, context):
+    """Function to generate tags using Retrieval Augmented Generation
+    """
+
+    try:
+        API_KEY = st.session_state["OPENAI_API_KEY"]
+        os.environ['OPENAI_API_KEY'] = API_KEY
+    except Exception as e:
+         return st.error("Invalid [OpenAI API key](https://beta.openai.com/account/api-keys) or not found")
+    
+    loader = TextLoader("demoapp/category.txt").load()
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+    documents = text_splitter.split_documents(loader)
+    vectorstore = Chroma.from_documents(documents, OpenAIEmbeddings())
+    retriever = vectorstore.as_retriever()
+
+    # LLM
+    template = """You are a trustworthy assistant for question-answering tasks.
+    Use the following pieces of retrieved context to answer the question.
+    Question: {question}
+    Context: {context}
+    Answer:
+    
+    """
+
+    prompt = PromptTemplate.from_template(template)
+    llm = ChatOpenAI(openai_api_key=API_KEY, temperature=0, model='gpt-4')
+
+    rag_chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    query = f"""Output top 3 tags from the category {category} that is relevant to the context {context}
+    """
+        
+    response = rag_chain.invoke(query)
+    return response
+
 
 def generate_response(text, title):
+    """Function to generate response"""
     try:
         API_KEY = st.session_state['OPENAI_API_KEY']
     except Exception as e:
-        response = st.error("Invalid [OpenAI API key](https://beta.openai.com/account/api-keys) or not found")
-        return response
+        return st.error("Invalid [OpenAI API key](https://beta.openai.com/account/api-keys) or not found")
+    
+    prompt = PromptTemplate(input_variables=["context", "title"], template=template)
 
-  
     # Instantiate LLM model
     with get_openai_callback() as cb:
         llm = LLMChain(
             llm = ChatOpenAI(openai_api_key=API_KEY,
-                     temperature=0.01, model="gpt-4"), prompt=prompt)
+                     temperature=0.01, model="gpt-3.5-turbo-1106"), prompt=prompt)
         
         response = llm.predict(context=text, title=title)
-        
-        st.write(f"Total Tokens: {cb.total_tokens}")
-        st.write(f"Prompt Tokens: {cb.prompt_tokens}")
-        st.write(f"Completion Tokens: {cb.completion_tokens}")
-        st.write(f"Total Cost (USD): ${cb.total_cost}")
+        return response, cb.total_tokens, cb.prompt_tokens, cb.completion_tokens, cb.total_cost
 
-        return response
+# Function to update or append to CSV
+def update_csv(title, summarized_bill, csv_file_path):
+    """Function to update the csv for it to be downloadable"""
+    try:
+        df = pd.read_csv(csv_file_path)
+    except FileNotFoundError:
+        # If the file does not exist, create a new DataFrame
+        df = pd.DataFrame(columns=["Original Bills", "Summarized Bills"])
+    
+    mask = df["Original Bills"] == title
+    if mask.any():
+        df.loc[mask, "Summarized Bills"] = summarized_bill
+    else:
+        new_bill = pd.DataFrame([[title, summarized_bill]], columns=["Original Bills", "Summarized Bills"])
+        df = pd.concat([df, new_bill], ignore_index=True)
+    
+    df.to_csv(csv_file_path, index=False)
+    return df
+
+
+csv_file_path = "demoapp/generated_bills.csv"
 
 answer_container = st.container()
-
 with answer_container:
-    col1, col2 = st.columns(2, gap='medium')
     submit_button = st.button(label='Summarize')
+    # col1, col2, col3 = st.columns(3, gap='medium')
+    col1, col2, col3 = st.columns([1.5, 1.5, 1])
 
     if submit_button:
-        
-        # generate response
-        response = generate_response(bill_content, bill_title)
+        with st.spinner("Working hard..."):
+            
+                response, response_tokens, prompt_tokens, completion_tokens, response_cost = generate_response(bill_content, bill_title)
+                category_response = generate_categories(bill_content)
+                tag_response = generate_tags(category_response, bill_content)
+                
+                with col1:
+                    st.subheader(f"Original Bill: #{bill_number}")
+                    st.write(bill_title)
+                    st.write(bill_content)
 
-        with col1:
-            st.subheader("Original Bill")
-            st.write(bill_title)
-            st.write(bill_content)
-        
-        with col2:
-            st.subheader("Generated Text")
-            try:
-                st.write(response)
-            except Exception as e:
-                st.error("no response")
+                with col2:
+                    st.subheader("Generated Text")
+                    st.write(response)
+                    st.write("###")
+                    st.write(category_response)
+                    st.write(tag_response)
+                    
+                with col3:
+                    st.subheader("Evaluation Metrics")
+                    # rouge score addition
+                    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+                    rouge_scores = scorer.score(bill_content, response)
+                    st.write(f"ROUGE-1 Score: {rouge_scores['rouge1'].fmeasure:.2f}")
+                    st.write(f"ROUGE-2 Score: {rouge_scores['rouge2'].fmeasure:.2f}")
+                    st.write(f"ROUGE-L Score: {rouge_scores['rougeL'].fmeasure:.2f}")
+                    
+                    # calc cosine similarity
+                    vectorizer = TfidfVectorizer()
+                    tfidf_matrix = vectorizer.fit_transform([bill_content, response])
+                    cosine_sim = cosine_similarity(tfidf_matrix[0], tfidf_matrix[1])
+                    st.write(f"Cosine Similarity Score: {cosine_sim[0][0]:.2f}")
+
+                    # test hallucination
+                    scores = model.predict([
+                        [bill_content, response]
+                    ])
+                    score_result = float(scores[0])
+                    st.write(f"Factual Consistency Score: {round(score_result, 2)}")
+                    st.write("###")
+                    st.subheader("Token Usage")
+                    st.write(f"Response Tokens: {response_tokens}")
+                    
+
+                    st.write(f"Prompt Response: {prompt_tokens}")
+                    
+
+                    st.write(f"Response Complete:{completion_tokens}")
+                    
+                    
+                    st.write(f"Response Cost: $ {response_cost}")
 
     
